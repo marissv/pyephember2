@@ -8,12 +8,75 @@ import datetime
 import json
 import time
 import collections
+import threading
+import logging
 
 from enum import Enum
-from typing import OrderedDict
+from typing import OrderedDict, Callable, Optional, Dict, Any, List, Union
 
 import requests
 import paho.mqtt.client as mqtt
+
+# Logger for MQTT operations
+_mqtt_logger = logging.getLogger("pyephember2.mqtt")
+
+
+def decode_point_data(pstr: str) -> Dict[int, Dict[str, Any]]:
+    """
+    Parse base64-encoded pointData into a dictionary.
+    
+    Returns dict mapping pointIndex to:
+        {
+            'index': int,
+            'datatype': int,
+            'raw_bytes': str (dotted bytes),
+            'value': int
+        }
+    """
+    lengths = {1: 1, 2: 2, 4: 2, 5: 4}
+    parsed = {}
+    mode = "wait"
+    datatype = None
+    index = None
+    value = []
+
+    def bytes_to_int(byte_data):
+        result = 0
+        for a_byte in byte_data:
+            result = result * 256 + int(a_byte)
+        return result
+
+    for number in base64.b64decode(pstr):
+        if mode == "wait":
+            if number != 0:
+                continue  # Skip unexpected bytes
+            mode = "index"
+            continue
+        if mode == "index":
+            index = number
+            mode = "datatype"
+            continue
+        if mode == "datatype":
+            datatype = number
+            if datatype not in lengths:
+                _mqtt_logger.warning(f"Unknown datatype: {datatype}")
+                mode = "wait"
+                continue
+            mode = "value"
+            continue
+        if mode == "value":
+            value.append(number)
+            if len(value) == lengths[datatype]:
+                parsed[index] = {
+                    'index': index,
+                    'datatype': datatype,
+                    'raw_bytes': ".".join([str(x) for x in value]),
+                    'value': bytes_to_int(value)
+                }
+                value = []
+                mode = "wait"
+            continue
+    return parsed
 
 
 class ZoneMode(Enum):
@@ -21,76 +84,269 @@ class ZoneMode(Enum):
     Modes that a zone can be set too
     """
 
-    # pylint: disable=invalid-name
     AUTO = 0
     ALL_DAY = 1
     ON = 2
     OFF = 3
 
 
-def GetPointIndex(zone, pointIndex) -> int:
-    assert isinstance(pointIndex, PointIndex)
-    match pointIndex:
-        case PointIndex.ADVANCE_ACTIVE:
-            return 4
-        case PointIndex.CURRENT_TEMP:
-            return 5
-        case PointIndex.TARGET_TEMP:
-            match zone["deviceType"]:
-                case 773:
-                    return 12
-                case _:
-                    return 6
-        case PointIndex.MODE:
-            match zone['deviceType']:
-                case 514 | 773:
-                    return 11
-                case 2 | 4:
-                    return 7
-                case _:
-                    return 7
-        case PointIndex.BOOST_HOURS:
-            match zone["deviceType"]:
-                case 514 | 773:
-                    # Returns 0 if boost is OFF and 1 if ON
-                    return 13
-                case _:
-                    return 8
-        case PointIndex.BOOST_TIME:
-            return 9
-        case PointIndex.BOILER_STATE:
-            return 10
-        case PointIndex.BOOST_TEMP:
-            return 14
-        case PointIndex.CTR_15_ABAB:
-            return 15
-        case PointIndex.XXX_16_0000:
-            return 16
-        case PointIndex.CTR_17_ABAB:
-            return 17
-        case PointIndex.CTR_18_0AB7:
-            return 18
-        case _:
-            RuntimeError('Unknown PointIndex:' + pointIndex)
+# Mapping of system types to their zone mode value mappings
+# This is the single source of truth for mode conversions
+EMBER_MODE_MAP: dict[str, dict[ZoneMode, int]] = {
+    # TS / RS systems
+    "EMBER-TS1": {
+        ZoneMode.AUTO: 0,
+        ZoneMode.ON: 1,
+        ZoneMode.OFF: 4,
+    },
+    "EMBER-TS2": {
+        ZoneMode.AUTO: 0,
+        ZoneMode.ON: 1,
+        ZoneMode.OFF: 4,
+    },
+    "EMBER-TS": {
+        ZoneMode.AUTO: 0,
+        ZoneMode.ON: 1,
+        ZoneMode.OFF: 4,
+},
+    "EMBER-RS": {
+        ZoneMode.AUTO: 0,
+        ZoneMode.ON: 1,
+        ZoneMode.OFF: 4,
+    },
+    # EPS systems
+    "EMBER-PS": {
+        ZoneMode.AUTO: 0,
+        ZoneMode.ALL_DAY: 1,
+        ZoneMode.ON: 2,
+        ZoneMode.OFF: 3,
+    },
+    "EMBER-PS2": {
+        ZoneMode.AUTO: 0,
+        ZoneMode.ALL_DAY: 9,
+        ZoneMode.ON: 10,
+        ZoneMode.OFF: 4,
+    },
+}
 
 
-class PointIndex(Enum):
+def _get_zone_lock(zone: dict) -> threading.RLock:
     """
-    Point indices for pointData returned by API
+    Get or create a reentrant lock for a zone's pointDataList.
+    Thread-safe access to pointDataList requires this lock.
+    """
+    if '_pointdata_lock' not in zone:
+        # Create lock if it doesn't exist
+        # Note: This initialization is not fully thread-safe, but acceptable since
+        # lock creation is idempotent and races are rare (worst case: two locks created, one discarded)
+        lock = threading.RLock()
+        zone['_pointdata_lock'] = lock
+    return zone['_pointdata_lock']
+
+
+def _get_pointdata_value_by_index(zone: dict, point_index: int) -> Optional[int]:
+    """
+    Directly get a value from pointDataList by point index.
+    Helper function to avoid circular dependencies.
+    Thread-safe: Uses per-zone lock to protect pointDataList access.
+    Returns None if point not found.
+    """
+    lock = _get_zone_lock(zone)
+    with lock:
+        if 'pointDataList' not in zone:
+            return None
+        
+        for datum in zone['pointDataList']:
+            if datum.get('pointIndex') == point_index:
+                try:
+                    return int(datum.get('value', 0))
+                except (ValueError, TypeError):
+                    return None
+        return None
+
+
+def GetPointIndex(zone, ephFunction) -> int:
+    """
+    Get the point index for a given EphFunction and zone.
+    
+    Uses EMBER_POINT_INDEX_MAP to look up point indices based on systemType.
+    For functions that require runtime evaluation (like TARGET_TEMP), a callable
+    is stored in the map that will be called with the zone dict.
+    
+    Args:
+        zone: Zone dictionary containing systemType
+        ephFunction: EphFunction enum member
+        
+    Returns:
+        Point index (int) if found, -1 if not supported or systemType unknown
+    """
+    assert isinstance(ephFunction, EphFunction)
+    
+    system_type = zone.get("systemType")
+    if system_type is None:
+        return -1  # Cannot determine point index without systemType
+    
+    system_map = EMBER_POINT_INDEX_MAP.get(system_type)
+    if system_map is None:
+        return -1  # Unknown systemType
+    
+    # Check if this function is supported for this system type
+    if ephFunction not in system_map:
+        return -1  # Function not supported for this system type
+    
+    value = system_map[ephFunction]
+    
+    # If it's a callable (special handling like TARGET_TEMP), call it with zone
+    if callable(value):
+        return value(zone)
+    
+    # Otherwise, return the static value
+    return value
+
+
+class EphFunction(Enum):
+    """
+    EPH function identifiers for pointData operations
     """
 
-    ADVANCE_ACTIVE = 4
-    CURRENT_TEMP = 5
-    TARGET_TEMP = 6
-    MODE = 7
-    BOOST_HOURS = 8
-    BOOST_TIME = 9
-    BOILER_STATE = 10
-    BOOST_TEMP = 14
-    CTR_15_ABAB = 15
-    XXX_16_0000 = 16
-    CTR_17_ABAB = 17
-    CTR_18_0AB7 = 18
+    ADVANCE_ACTIVE = 1
+    CURRENT_TEMP = 2
+    TARGET_TEMP = 3
+    MODE = 5
+    BOOST_HOURS = 6
+    BOOST_TIME = 7
+    BOILER_STATE = 8
+    BOOST_TEMP = 9
+    MAX_TEMP = 10
+    MIN_TEMP = 11
+    AUTO_OVERRIDE = 12
+    
+
+# Special function for TARGET_TEMP that requires runtime logic
+def _get_target_temp_index(zone: dict) -> int:
+    """
+    Get TARGET_TEMP point index based on mode and override state.
+    
+    This requires runtime evaluation because the index depends on:
+    - Current mode (AUTO vs manual)
+    - AUTO_OVERRIDE state (for AUTO mode)
+    
+    Only called for EMBER-TS1, EMBER-TS2, and EMBER-PS2.
+    All three systems use the same logic:
+    - AUTO mode with override active: index 17
+    - AUTO mode without override: index 6
+    - Manual mode: index 12
+    
+    Note: Uses hardcoded indices (11 for MODE, 16 for AUTO_OVERRIDE) to avoid
+    circular dependencies with GetPointIndex.
+    """
+    system_type = zone.get("systemType")
+    if system_type is None:
+        return -1
+    
+    # Directly read MODE value (point index 11) - same for TS1/TS2/PS2
+    mode_value = _get_pointdata_value_by_index(zone, 11)
+    if mode_value == 0:  # AUTO mode
+        # Directly read AUTO_OVERRIDE value (point index 16) - same for TS1/TS2/PS2
+        override_value = _get_pointdata_value_by_index(zone, 16)
+        return 17 if (override_value == 1) else 6  # Override active: 17, else 6
+    else:
+        return 12  # Manual Mode
+
+
+# Mapping of system types to their point index mappings
+# This is the single source of truth for point index conversions
+# Values can be:
+#   - int: Direct point index value
+#   - Callable: Function that takes zone dict and returns int (for runtime logic)
+EMBER_POINT_INDEX_MAP: dict[str, dict[EphFunction, Union[int, Callable[[dict], int]]]] = {
+    "EMBER-TS1": {
+        # Universal functions (same across all systems)
+        EphFunction.ADVANCE_ACTIVE: 4,
+        EphFunction.CURRENT_TEMP: 5,
+        EphFunction.BOOST_TEMP: 14,
+        # System-specific functions
+        EphFunction.TARGET_TEMP: _get_target_temp_index,  # Special handling required
+        EphFunction.MODE: 11,
+        EphFunction.BOOST_HOURS: 13,
+        EphFunction.BOOST_TIME: 15,
+        EphFunction.BOILER_STATE: 18,
+        EphFunction.MAX_TEMP: 7,
+        EphFunction.MIN_TEMP: 8,
+        EphFunction.AUTO_OVERRIDE: 16,
+    },
+    "EMBER-TS2": {
+        # Universal functions (same across all systems)
+        EphFunction.ADVANCE_ACTIVE: 4,
+        EphFunction.CURRENT_TEMP: 5,
+        EphFunction.BOOST_TEMP: 14,
+        # System-specific functions
+        EphFunction.TARGET_TEMP: _get_target_temp_index,  # Special handling required
+        EphFunction.MODE: 11,
+        EphFunction.BOOST_HOURS: 13,
+        EphFunction.BOOST_TIME: 15,
+        EphFunction.BOILER_STATE: 18,
+        EphFunction.MAX_TEMP: 7,
+        EphFunction.MIN_TEMP: 8,
+        EphFunction.AUTO_OVERRIDE: 16,
+    },
+     "EMBER-TS": {
+        # Universal functions (same across all systems)
+        EphFunction.ADVANCE_ACTIVE: 4,
+       EphFunction.CURRENT_TEMP: 5,
+       EphFunction.BOOST_TEMP: 14,
+       # System-specific functions
+       EphFunction.TARGET_TEMP: _get_target_temp_index,
+       EphFunction.MODE: 11,
+       EphFunction.BOOST_HOURS: 13,
+       EphFunction.BOOST_TIME: 15,
+       EphFunction.BOILER_STATE: 18,
+       EphFunction.MAX_TEMP: 7,
+       EphFunction.MIN_TEMP: 8,
+       EphFunction.AUTO_OVERRIDE: 16,
+    },
+    "EMBER-RS": {
+        # Universal functions (same across all systems)
+        EphFunction.ADVANCE_ACTIVE: 4,
+        EphFunction.CURRENT_TEMP: 5,
+        EphFunction.BOOST_TEMP: 14,
+        # System-specific functions
+        EphFunction.TARGET_TEMP: 12,  # Static value - always 12 for EMBER-RS
+        EphFunction.MODE: 11,
+        EphFunction.BOOST_HOURS: 13,
+        EphFunction.BOOST_TIME: 15,
+        EphFunction.BOILER_STATE: 18,
+        # MAX_TEMP, MIN_TEMP, AUTO_OVERRIDE not supported for EMBER-RS
+    },
+    "EMBER-PS": {
+        # Universal functions (same across all systems)
+        EphFunction.ADVANCE_ACTIVE: 4,
+        EphFunction.CURRENT_TEMP: 5,
+        EphFunction.BOOST_TEMP: 14,
+        # System-specific functions
+        EphFunction.TARGET_TEMP: 6,  # Simple static mapping
+        EphFunction.MODE: 7,
+        EphFunction.BOOST_HOURS: 8,
+        EphFunction.BOOST_TIME: 9,
+        EphFunction.BOILER_STATE: 10,
+        # MAX_TEMP, MIN_TEMP, AUTO_OVERRIDE not supported for EMBER-PS
+    },
+    "EMBER-PS2": {
+        # Universal functions (same across all systems)
+        EphFunction.ADVANCE_ACTIVE: 4,
+        EphFunction.CURRENT_TEMP: 5,
+        EphFunction.BOOST_TEMP: 14,
+        # System-specific functions
+        EphFunction.TARGET_TEMP: _get_target_temp_index,  # Special handling required
+        EphFunction.MODE: 11,
+        EphFunction.BOOST_HOURS: 13,
+        EphFunction.BOOST_TIME: 15,
+        EphFunction.BOILER_STATE: 18,
+        EphFunction.MAX_TEMP: 7,
+        EphFunction.MIN_TEMP: 8,
+        EphFunction.AUTO_OVERRIDE: 16,
+    },
+}
 
 
 # """
@@ -115,7 +371,8 @@ def zone_command_to_ints(zone, command):
         'MODE': 'SMALL_INT',
         'BOOST_HOURS': 'SMALL_INT',
         'BOOST_TIME': 'TIMESTAMP',
-        'BOOST_TEMP': 'TEMP_RW'
+        'BOOST_TEMP': 'TEMP_RW',
+        'AUTO_OVERRIDE': 'SMALL_INT'
     }
     if command.name not in writable_command_types:
         raise ValueError(
@@ -128,7 +385,11 @@ def zone_command_to_ints(zone, command):
     if command.index is not None:
         command_index = command.index
     else:
-        command_index = GetPointIndex(zone, PointIndex[command.name])
+        command_index = GetPointIndex(zone, EphFunction[command.name])
+        if command_index == -1:
+            raise ValueError(
+                f"No point index found for EphFunction: {command.name}"
+            )
 
     # command header: [0, index, type_id]
     int_array = [0, command_index, type_data[command_type]['id']]
@@ -168,24 +429,20 @@ def zone_advance_active(zone):
     """
     Check if zone has advance active
     """
-    match zone["deviceType"]:
-        case 773:
-            # Mode not supported
+    system_type = zone.get("systemType")
+    match system_type:
+        case "EMBER-PS":
+            return zone_pointdata_value(zone, EphFunction.ADVANCE_ACTIVE) != 0
+        case _: 
             return False
-        case 514:
-            # Need to fix, point index or value is not right
-            return False
-        case _:
-            return zone_pointdata_value(zone, PointIndex.ADVANCE_ACTIVE) != 0
-
+            
 
 def boiler_state(zone):
     """
     Return the boiler state for a zone, as given by the API
-    Probable interpretation:
-    0 => FIXME, 1 => flame off, 2 => flame on
+    1 => flame off, 2 => flame on
     """
-    return zone_pointdata_value(zone, PointIndex.BOILER_STATE)
+    return zone_pointdata_value(zone, EphFunction.BOILER_STATE)
 
 def lastKey(dict):
     return list(dict.keys())[-1]
@@ -320,13 +577,31 @@ def zone_is_scheduled_on(zone):
     return False
 
 # Hot water devices - no temperature control
-HotWaterDevices = [4, 514]
+HotWaterDevices = [4, 516]
 
 def zone_is_hotwater(zone):
-    if zone["deviceType"] in HotWaterDevices:
-        return True
-    else:
+    """
+    Check if zone is a hot water device.
+    Hot water devices (deviceType 4, 516) have no temperature control.
+    """
+    return zone.get("deviceType") in HotWaterDevices
+
+def zone_supports_all_day(zone):
+    """
+    Check if zone supports ALL_DAY mode.
+    
+    Returns True if the zone's systemType has ALL_DAY mode in EMBER_MODE_MAP.
+    Returns False otherwise (including if systemType is missing or unknown).
+    """
+    system_type = zone.get("systemType")
+    if system_type is None:
         return False
+    
+    system_map = EMBER_MODE_MAP.get(system_type)
+    if system_map is None:
+        return False
+    
+    return ZoneMode.ALL_DAY in system_map
 
 def zone_name(zone):
     """
@@ -346,150 +621,234 @@ def zone_boost_hours(zone):
     """
     Return zone boost hours
     """
-    return zone_pointdata_value(zone, PointIndex.BOOST_HOURS)
+    return zone_pointdata_value(zone, EphFunction.BOOST_HOURS)
 
 
 def zone_boost_timestamp(zone):
     """
     Return zone boost hours
     """
-    return zone_pointdata_value(zone, PointIndex.BOOST_TIME)
+    return zone_pointdata_value(zone, EphFunction.BOOST_TIME)
 
-
-def zone_temperature(zone, label):
-    """
-    Return temperature (float) from the PointIndex value for label (str)
-    """
-    if zone["deviceType"] == 773:
-        # in auto mode need to find program target temp.
-        if zone_mode(zone) == ZoneMode.AUTO and label == PointIndex.TARGET_TEMP:
-            programs = zone_get_running_program(zone)
-            if programs is not None:
-                return programs[0]["temperature"] / 10
-            else:
-                return None
-        else:
-            return zone_pointdata_value(zone, PointIndex(label)) / 10
-    else:
-        return zone_pointdata_value(zone, PointIndex(label)) / 10
 
 def zone_target_temperature(zone):
     """
     Get target temperature for this zone
     """
-    match zone["deviceType"]:
-        case 514:
-            return None
-        case _:
-            return zone_temperature(zone, PointIndex.TARGET_TEMP)
+    system_type = zone.get("systemType")
+    if system_type is None:
+        raise RuntimeError("zone missing 'systemType' field")
+    if system_type == "EMBER-RS":
+        # in auto mode need to find program target temp.
+        if zone_mode(zone) == ZoneMode.AUTO:
+            programs = zone_get_running_program(zone)
+            if programs is not None:
+                return programs[0]["temperature"] / 10
+            else:
+                return 0
+    result = zone_pointdata_value(zone, EphFunction.TARGET_TEMP)
+    if result is None:
+        return 0
+    return result / 10
 
 def zone_boost_temperature(zone):
     """
-    Get target temperature for this zone
+    Get boost temperature for this zone
     """
-    return zone_temperature(zone, PointIndex.BOOST_TEMP)
+    result = zone_pointdata_value(zone, EphFunction.BOOST_TEMP)
+    if result is None:
+        return 0
+    return result / 10
 
 
 def zone_current_temperature(zone):
     """
     Get current temperature for this zone
     """
-    match zone["deviceType"]:
-        case 514:
-            return None
-        case _:
-            return zone_temperature(zone, PointIndex.CURRENT_TEMP)
+    result = zone_pointdata_value(zone, EphFunction.CURRENT_TEMP)
+    if result is None:
+        return 0
+    return result / 10
 
 
-def zone_pointdata_value(zone, pointIndex):
+def zone_max_temperature(zone):
+    """
+    Get maximum temperature for this zone
+    """
+    result = zone_pointdata_value(zone, EphFunction.MAX_TEMP)
+    if result is None:
+        # Default values: 60.0 for hot water, 35.0 for others
+        return 60.0 if zone_is_hotwater(zone) else 35.0
+    return result / 10
+
+
+def zone_min_temperature(zone):
+    """
+    Get minimum temperature for this zone
+    """
+    result = zone_pointdata_value(zone, EphFunction.MIN_TEMP)
+    if result is None:
+        # Default value: 5.0 for all zones
+        return 5.0
+    return result / 10
+
+
+def zone_pointdata_value(zone, ephFunction):
     """
     Get value of given index for this zone, as an integer
-    index can be either an integer index, or a string label
-    from the PointIndex enum: 'ADVANCE_ACTIVE', 'CURRENT_TEMP', etc
+    ephFunction should be an EphFunction enum member
+    Thread-safe: Uses per-zone lock to protect pointDataList access.
     """
     # pylint: disable=unsubscriptable-object
-    index = GetPointIndex(zone, pointIndex)
+    index = GetPointIndex(zone, ephFunction)
+    
+    if index == -1:
+        return None  # No point index found
 
-    for datum in zone['pointDataList']:
-        if datum['pointIndex'] == index:
-            return int(datum['value'])
+    lock = _get_zone_lock(zone)
+    with lock:
+        for datum in zone['pointDataList']:
+            if datum['pointIndex'] == index:
+                return int(datum['value'])
 
     return None
 
 
 def zone_mode(zone):
     """
-    Get mode for this zone
-    Default settings based on next known devices
-    deviceTypes 2 | 4:
-    AUTO = 0
-    ALL_DAY = 1
-    ON = 2
-    OFF = 3
-
-    deviceTypes 773:
-    AUTO = 0
-    ON/Manual = 1
-    BOOST = 0 ? Could be another point index
-    OFF = 4
-
-    deviceTypes 514:
-    AUTO = 0
-    ADVANCE = 0 ? Could be another point index
-    ALL_DAY = 9
-    ON/Manual = 10
-    BOOST = 0 ? Could be another point index
-    OFF = 4
+    Get mode for this zone.
+    
+    Uses EMBER_MODE_MAP to convert the numeric mode value from the device
+    to a ZoneMode enum value based on the zone's systemType.
     """
+    mode_value = zone_pointdata_value(zone, EphFunction.MODE)
+    system_type = zone.get("systemType")
+    if system_type is None:
+        raise RuntimeError("zone missing 'systemType' field")
+    
+    system_map = EMBER_MODE_MAP.get(system_type)
+    if system_map is None:
+        raise RuntimeError(
+            f"Unhandled systemType {system_type} for zone_mode. "
+            f"Expected: {', '.join(sorted(EMBER_MODE_MAP.keys()))}"
+        )
+    
+    # Reverse lookup: find ZoneMode for the given mode_value
+    for z_mode, ember_value in system_map.items():
+        if ember_value == mode_value:
+            return z_mode
+    
+    # mode_value not found in mapping
+    expected_values = ", ".join(str(v) for v in sorted(set(system_map.values())))
+    raise RuntimeError(
+        f"Unknown modeValue {mode_value} for systemType {system_type}. "
+        f"Expected values: {expected_values}"
+    )
 
-    modeValue = zone_pointdata_value(zone, PointIndex.MODE)
-    match modeValue:
-        case 0:
-            return ZoneMode.AUTO
-        case 1 | 9:
-            match zone["deviceType"]:
-                case 773:
-                    return ZoneMode.ON
-                case _:
-                    return ZoneMode.ALL_DAY
-        case 2 | 10:
-            return ZoneMode.ON
-        case 3 | 4:
-            return ZoneMode.OFF
+
+def zone_auto_override(zone):
+    """
+    Check if AUTO_OVERRIDE is set for this zone.
+    
+    Returns True if AUTO_OVERRIDE is active (value = 1), False otherwise.
+    Only supported for device types 258 and 514.
+    For other device types, returns False.
+    """
+    override_value = zone_pointdata_value(zone, EphFunction.AUTO_OVERRIDE)
+    if override_value is None:
+        return False  # Not supported or not found
+    return override_value == 1
+
 
 def get_zone_mode_value(zone, mode) -> int:
-    if mode == ZoneMode.AUTO:
-        return 0
-
-    match zone['deviceType']:
-        case 773:
-            match mode:
-                case ZoneMode.ON:
-                    return 1
-                case ZoneMode.OFF:
-                    return 4
-        case 514:
-            match mode:
-                case ZoneMode.ALL_DAY:
-                    return 9
-                case ZoneMode.ON:
-                    return 10
-                case ZoneMode.OFF:
-                    return 4
-        case _:
-            match mode:
-                case ZoneMode.ALL_DAY:
-                    return 1
-                case ZoneMode.ON:
-                    return 2
-                case ZoneMode.OFF:
-                    return 3
-
+    """
+    Convert ZoneMode enum to the numeric mode value expected by the zone.
+    
+    Uses EMBER_MODE_MAP to convert a ZoneMode enum value to the numeric
+    value expected by the device based on the zone's systemType.
+    """
+    system_type = zone.get("systemType")
+    if system_type is None:
+        raise RuntimeError("zone missing 'systemType' field")
+    
+    system_map = EMBER_MODE_MAP.get(system_type)
+    if system_map is None:
+        raise RuntimeError(
+            f"Unhandled systemType {system_type} for get_zone_mode_value. "
+            f"Expected: {', '.join(sorted(EMBER_MODE_MAP.keys()))}"
+        )
+    
+    value = system_map.get(mode)
+    if value is None:
+        expected_modes = ", ".join(m.name for m in sorted(system_map.keys(), key=lambda m: m.value))
+        raise RuntimeError(
+            f"Unhandled ZoneMode {mode} for systemType {system_type}. "
+            f"Expected modes: {expected_modes}"
+        )
+    
+    return value
 
 class EphMessenger:
     """
-    MQTT interface to the EphEmber API
+    MQTT interface to the EphEmber API.
+    
+    Supports both sending commands and subscribing to receive updates.
     """
+
+    def __init__(self, parent):
+        self.api_url = 'eu-base-mqtt.topband-cloud.com'
+        self.api_port = 18883
+
+        self.client = None
+        self.client_id = None
+        self.parent = parent
+        
+        # Subscription state
+        self._subscribed = False
+        self._loop_running = False
+        self._subscribed_topics = []
+        
+        # Callbacks for received data
+        self._on_pointdata_callback: Optional[Callable] = None
+        self._on_message_callback: Optional[Callable] = None
+        self._on_connect_callback: Optional[Callable] = None
+        self._on_disconnect_callback: Optional[Callable] = None
+        
+        # External log callback for test.py integration
+        self._log_callback: Optional[Callable] = None
+        
+        # Zone state cache (updated from MQTT messages)
+        self._zone_state_cache: Dict[str, Dict[int, Any]] = {}
+
+    def _log(self, direction: str, content: str):
+        """Log MQTT communication if callback is set."""
+        if self._log_callback:
+            self._log_callback(direction, content)
+        _mqtt_logger.debug(f"[{direction}] {content}")
+
+    def set_log_callback(self, callback: Callable[[str, str], None]):
+        """Set callback for logging MQTT communication.
+        
+        Args:
+            callback: Function(direction, content) where direction is 'SEND', 'RECV', 'INFO'
+        """
+        self._log_callback = callback
+
+    def set_on_pointdata_callback(self, callback: Callable[[str, Dict], None]):
+        """Set callback for when pointData is received.
+        
+        Args:
+            callback: Function(zone_mac, parsed_pointdata) called when data arrives
+        """
+        self._on_pointdata_callback = callback
+
+    def set_on_message_callback(self, callback: Callable[[str, Dict], None]):
+        """Set callback for raw MQTT messages.
+        
+        Args:
+            callback: Function(topic, message_dict) called for every message
+        """
+        self._on_message_callback = callback
 
     def _zone_command_b64(self, zone, cmd, stop_mqtt=True, timeout=1):
         """
@@ -498,6 +857,7 @@ class EphMessenger:
         """
         product_id = zone["productId"]
         uid = zone["uid"]
+        topic = "/".join([product_id, uid, "download/pointdata"])
 
         msg = json.dumps(
             {
@@ -514,26 +874,92 @@ class EphMessenger:
             }
         )
 
+        # Log the outgoing message
+        self._log('SEND', f"Topic: {topic}\nPayload: {msg}")
+
         started_locally = False
         if not self.client or not self.client.is_connected():
             started_locally = True
             self.start()
 
-        pub = self.client.publish(
-            "/".join([product_id, uid, "download/pointdata"]), msg, 0
-        )
+        pub = self.client.publish(topic, msg, 0)
         pub.wait_for_publish(timeout=timeout)
 
-        if started_locally and stop_mqtt:
+        if started_locally and stop_mqtt and not self._subscribed:
             self.stop()
 
         return pub.is_published()
+
+    def _internal_on_connect(self, client, userdata, flags, reason_code, properties=None):
+        """Internal callback for MQTT connection."""
+        self._log('INFO', f"Connected to MQTT broker (reason: {reason_code})")
+        
+        # Subscribe to topics
+        for topic in self._subscribed_topics:
+            client.subscribe(topic, 0)
+            self._log('INFO', f"Subscribed to: {topic}")
+        
+        if self._on_connect_callback:
+            self._on_connect_callback(client, userdata, flags, reason_code)
+
+    def _internal_on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties=None):
+        """Internal callback for MQTT disconnection."""
+        self._log('INFO', f"Disconnected from MQTT broker (reason: {reason_code})")
+        self._subscribed = False
+        
+        if self._on_disconnect_callback:
+            self._on_disconnect_callback(client, userdata, disconnect_flags, reason_code)
+
+    def _internal_on_message(self, client, userdata, message):
+        """Internal callback for received MQTT messages."""
+        try:
+            topic = message.topic
+            payload = message.payload.decode("utf-8").rstrip('\0')
+            
+            self._log('RECV', f"Topic: {topic}\nPayload: {payload}")
+            
+            msg_dict = json.loads(payload)
+            
+            # Call raw message callback if set
+            if self._on_message_callback:
+                self._on_message_callback(topic, msg_dict)
+            
+            # Parse pointData if present
+            if 'data' in msg_dict and 'pointData' in msg_dict['data']:
+                mac = msg_dict.get('data', {}).get('mac', 'unknown')
+                pointdata_b64 = msg_dict['data']['pointData']
+                parsed = decode_point_data(pointdata_b64)
+                
+                # Update local cache
+                if mac not in self._zone_state_cache:
+                    self._zone_state_cache[mac] = {}
+                self._zone_state_cache[mac].update({k: v['value'] for k, v in parsed.items()})
+                
+                # Update the parent's cached zone data (HTTP cache)
+                # This allows legacy functions to see MQTT updates
+                if self.parent:
+                    self.parent.update_zone_from_mqtt(mac, parsed)
+                
+                # Call pointdata callback if set
+                if self._on_pointdata_callback:
+                    self._on_pointdata_callback(mac, parsed)
+                    
+        except Exception as e:
+            self._log('INFO', f"Error processing message: {e}")
+            _mqtt_logger.exception("Error processing MQTT message")
 
     # Public interface
 
     def start(self, callbacks=None, loop_start=False):
         """
-        Start MQTT client
+        Start MQTT client.
+        
+        Args:
+            callbacks: Optional dict of callback names to functions (legacy support)
+            loop_start: If True, start the network loop in a background thread
+        
+        Returns:
+            The mqtt.Client instance
         """
         credentials = self.parent.messenging_credentials()
         self.client_id = '{}_{}'.format(
@@ -548,26 +974,122 @@ class EphMessenger:
         user_name = "app/{}".format(token)
         mclient.username_pw_set(user_name, token)
 
+        # Set internal callbacks
+        mclient.on_connect = self._internal_on_connect
+        mclient.on_disconnect = self._internal_on_disconnect
+        mclient.on_message = self._internal_on_message
+
+        # Legacy callback support
         if callbacks is not None:
             for key in callbacks.keys():
-                setattr(mclient, key, callbacks[key])
+                if key == 'on_connect':
+                    self._on_connect_callback = callbacks[key]
+                elif key == 'on_message':
+                    self._on_message_callback = callbacks[key]
+                else:
+                    setattr(mclient, key, callbacks[key])
 
+        self._log('INFO', f"Connecting to {self.api_url}:{self.api_port}")
         mclient.connect(self.api_url, self.api_port)
 
         if loop_start:
             mclient.loop_start()
+            self._loop_running = True
 
         return mclient
 
     def stop(self):
         """
-        Disconnect MQTT client if connected
+        Disconnect MQTT client if connected.
+        
+        Returns:
+            True if disconnected, False if no client
         """
         if not self.client:
             return False
+        
+        if self._loop_running:
+            self.client.loop_stop()
+            self._loop_running = False
+            
         if self.client.is_connected():
             self.client.disconnect()
+            
+        self._subscribed = False
+        self._log('INFO', "MQTT client stopped")
         return True
+
+    def subscribe_to_zone(self, zone) -> bool:
+        """
+        Subscribe to updates for a specific zone.
+        
+        Args:
+            zone: Zone dict containing productId and uid
+            
+        Returns:
+            True if subscription initiated
+        """
+        product_id = zone["productId"]
+        uid = zone["uid"]
+        topic = "/".join([product_id, uid, "upload/pointdata"])
+        
+        if topic not in self._subscribed_topics:
+            self._subscribed_topics.append(topic)
+        
+        if self.client and self.client.is_connected():
+            self.client.subscribe(topic, 0)
+            self._log('INFO', f"Subscribed to: {topic}")
+            self._subscribed = True
+            return True
+        return False
+
+    def subscribe_to_all_zones(self, zones: List[Dict]) -> int:
+        """
+        Subscribe to updates for multiple zones.
+        
+        Args:
+            zones: List of zone dicts
+            
+        Returns:
+            Number of zones subscribed to
+        """
+        count = 0
+        for zone in zones:
+            if self.subscribe_to_zone(zone):
+                count += 1
+        return count
+
+    def start_listening(self, zones: List[Dict] = None):
+        """
+        Start MQTT client, subscribe to zones, and begin listening loop.
+        
+        Args:
+            zones: Optional list of zones to subscribe to
+        """
+        # Add topics to subscribe list
+        if zones:
+            for zone in zones:
+                product_id = zone["productId"]
+                uid = zone["uid"]
+                topic = "/".join([product_id, uid, "upload/pointdata"])
+                if topic not in self._subscribed_topics:
+                    self._subscribed_topics.append(topic)
+        
+        # Start with background loop
+        self.start(loop_start=True)
+        self._subscribed = True
+
+    def get_cached_zone_state(self, mac: str) -> Optional[Dict[int, Any]]:
+        """
+        Get cached state for a zone (updated from MQTT messages).
+        
+        Args:
+            mac: Zone MAC address
+            
+        Returns:
+            Dict mapping EphFunction to value, or None if not cached
+        """
+        return self._zone_state_cache.get(mac)
 
     def send_zone_commands(self, zone, commands, stop_mqtt=True, timeout=1):
         """
@@ -595,18 +1117,12 @@ class EphMessenger:
 
         ints_cmd = [x for cmd in commands for x in zone_command_to_ints(zone, cmd)]
 
+        # Don't stop MQTT if we're subscribed
+        effective_stop = stop_mqtt and not self._subscribed
+
         return self._zone_command_b64(
-            zone, ints_to_b64_cmd(ints_cmd), stop_mqtt, timeout
+            zone, ints_to_b64_cmd(ints_cmd), effective_stop, timeout
         )
-
-    def __init__(self, parent):
-        self.api_url = 'eu-base-mqtt.topband-cloud.com'
-        self.api_port = 18883
-
-        self.client = None
-        self.client_id = None
-
-        self.parent = parent
 
 
 class EphEmber:
@@ -759,15 +1275,24 @@ class EphEmber:
         return self._homes[0]['gatewayid']
 
     def _set_zone_target_temperature(self, zone, target_temperature):
-        return self.messenger.send_zone_commands(
-            zone,
-            ZoneCommand('TARGET_TEMP', target_temperature, GetPointIndex(zone, PointIndex.TARGET_TEMP))
-        )
+        cmds = []  # Initialize cmds list
+        system_type = zone.get("systemType")
+        if system_type is None:
+            raise RuntimeError("zone missing 'systemType' field")
+        if system_type in ("EMBER-TS1", "EMBER-TS2", "EMBER-PS2") and zone_mode(zone) == ZoneMode.AUTO:
+            cmds.append(ZoneCommand('AUTO_OVERRIDE', 1, None)) # set override to 1
+            # the next line uses 17 explicit as override is not yet set when calling GetPointIndex
+            # that is ugly and we need to find a way around that
+            cmds.append(ZoneCommand('TARGET_TEMP', target_temperature, 17)) # set target temperature
+        else:
+            cmds.append(ZoneCommand('TARGET_TEMP', target_temperature, None))
+        return self.messenger.send_zone_commands(zone, cmds)
+
 
     def _set_zone_boost_temperature(self, zone, target_temperature):
         return self.messenger.send_zone_commands(
             zone,
-            ZoneCommand('BOOST_TEMP', target_temperature)
+            ZoneCommand('BOOST_TEMP', target_temperature, None)
         )
 
     def _set_zone_advance(self, zone, advance=True):
@@ -777,34 +1302,67 @@ class EphEmber:
             advance = 0
         return self.messenger.send_zone_commands(
             zone,
-            ZoneCommand('ADVANCE_ACTIVE', advance)
+            ZoneCommand('ADVANCE_ACTIVE', advance, None)
         )
 
     def _set_zone_boost(self, zone, boost_temperature, num_hours, timestamp=0):
         """
         Internal method to set zone boost
 
-        num_hours should be 0, 1, 2 or 3
+        num_hours validation:
+        - For EMBER-TS1, EMBER-TS2, EMBER-PS2, EMBER-RS: max 1 hour (clamped if > 1)
+        - For EMBER-PS: max 3 hours (clamped if > 3)
 
         If boost_temperature is not None, send that
 
-        If timestamp is 0 (or omitted), use current timestamp
+        Timestamp calculation:
+        - For EMBER-TS1, EMBER-TS2, EMBER-PS2, EMBER-RS: current timestamp + num_hours (if timestamp=0)
+        - For EMBER-PS: current timestamp only (if timestamp=0)
 
         If timestamp is None, do not send timestamp at all.
         (maybe results in permanent boost?)
         """
-        cmds = [ZoneCommand('BOOST_HOURS', num_hours)]
+        system_type = zone.get("systemType")
+        if system_type is None:
+            raise RuntimeError("zone missing 'systemType' field")
+        
+        # Validate and clamp num_hours based on system type
+        match system_type:
+            case "EMBER-PS":
+                if num_hours > 3:
+                    num_hours = 3
+            case _:
+                # Use default of 1 hour for other system types
+                if num_hours > 1:
+                    num_hours = 1
+        
+        cmds = [ZoneCommand('BOOST_HOURS', num_hours, None)]
         if boost_temperature is not None:
-            cmds.append(ZoneCommand('BOOST_TEMP', boost_temperature))
+            cmds.append(ZoneCommand('BOOST_TEMP', boost_temperature, None))
         if timestamp is not None:
             if timestamp == 0:
-                timestamp = int(datetime.datetime.now().timestamp())
-            cmds.append(ZoneCommand('BOOST_TIME', timestamp))
+                match system_type:
+                    case "EMBER-PS":
+                        # For EMBER-PS: current time only
+                        timestamp = int(datetime.datetime.now().timestamp())
+                    case _:
+                        # use default: current time + num_hours
+                        timestamp = int((datetime.datetime.now() + datetime.timedelta(hours=num_hours)).timestamp())
+            cmds.append(ZoneCommand('BOOST_TIME', timestamp, None))
         return self.messenger.send_zone_commands(zone, cmds)
 
-    def _set_zone_mode(self, zone, mode_num, index):
+    def _set_zone_mode(self, zone, mode):
+        """
+        Internal method to set zone mode.
+        
+        Args:
+            zone: Zone dict
+            mode: ZoneMode enum value
+        """
+        assert isinstance(mode, ZoneMode)
+        modevalue = get_zone_mode_value(zone, mode)
         return self.messenger.send_zone_commands(
-            zone, ZoneCommand('MODE', mode_num, index)
+            zone, ZoneCommand('MODE', modevalue, None)
         )
 
     # Public interface
@@ -1015,6 +1573,20 @@ class EphEmber:
         zone = self.get_zone(zoneid)
         return zone_current_temperature(zone)
 
+    def get_zone_max_temperature(self, zoneid):
+        """
+        Get the maximum temperature for a zone
+        """
+        zone = self.get_zone(zoneid)
+        return zone_max_temperature(zone)
+
+    def get_zone_min_temperature(self, zoneid):
+        """
+        Get the minimum temperature for a zone
+        """
+        zone = self.get_zone(zoneid)
+        return zone_min_temperature(zone)
+
     def get_zone_target_temperature(self, zoneid):
         """
         Get the temperature for a zone
@@ -1117,12 +1689,7 @@ class EphEmber:
         assert isinstance(mode, ZoneMode)
 
         zone = self.get_zone(zoneid)
-        modevalue = get_zone_mode_value(zone, mode)
-        modeindex = GetPointIndex(zone, PointIndex.MODE)
-
-        return self._set_zone_mode(
-            self.get_zone(zoneid), modevalue, modeindex
-        )
+        return self._set_zone_mode(zone, mode)
 
     def get_zone_mode(self, zoneid):
         """
@@ -1131,11 +1698,234 @@ class EphEmber:
         zone = self.get_zone(zoneid)
         return zone_mode(zone)
 
+    # =========================================================================
+    # MQTT-specific methods
+    # =========================================================================
+    
+    def set_mqtt_log_callback(self, callback: Callable[[str, str], None]):
+        """Set callback for MQTT communication logging.
+        
+        Args:
+            callback: Function(direction, content) for logging
+        """
+        self.messenger.set_log_callback(callback)
+
+    def set_mqtt_pointdata_callback(self, callback: Callable[[str, Dict], None]):
+        """Set callback for when MQTT pointData is received.
+        
+        Args:
+            callback: Function(zone_mac, parsed_pointdata)
+        """
+        self.messenger.set_on_pointdata_callback(callback)
+
+    def start_mqtt_listener(self, zones: List[Dict] = None):
+        """Start MQTT listener to receive zone updates.
+        
+        Args:
+            zones: Optional list of zone dicts to subscribe to.
+                   If None, call get_zones() first and subscribe to all.
+        """
+        if zones is None:
+            homes = self.get_zones()
+            zones = []
+            for home in homes:
+                zones.extend(home.get('zones', []))
+        
+        self.messenger.start_listening(zones)
+
+    def stop_mqtt_listener(self):
+        """Stop MQTT listener."""
+        self.messenger.stop()
+
+    def is_mqtt_connected(self) -> bool:
+        """Check if MQTT client is connected."""
+        return self.messenger.client and self.messenger.client.is_connected()
+
+    def get_mqtt_cached_state(self, mac: str) -> Optional[Dict[int, Any]]:
+        """Get cached zone state from MQTT updates.
+        
+        Args:
+            mac: Zone MAC address
+            
+        Returns:
+            Dict mapping EphFunction to value, or None
+        """
+        return self.messenger.get_cached_zone_state(mac)
+
+    # MQTT control methods - these use MQTT directly (existing behavior)
+    # The existing set_* methods already use MQTT via messenger.send_zone_commands()
+    # These explicit _mqtt variants make it clear which transport is used
+    
+    def set_zone_target_temperature_mqtt(self, zoneid, target_temperature) -> bool:
+        """Set target temperature via MQTT.
+        
+        Args:
+            zoneid: Zone ID
+            target_temperature: Target temperature in degrees
+            
+        Returns:
+            True if command was published successfully
+        """
+        zone = self.get_zone(zoneid)
+        return self._set_zone_target_temperature(zone, target_temperature)
+
+    def set_zone_mode_mqtt(self, zoneid, mode: ZoneMode) -> bool:
+        """Set zone mode via MQTT.
+        
+        Args:
+            zoneid: Zone ID
+            mode: ZoneMode enum value
+            
+        Returns:
+            True if command was published successfully
+        """
+        assert isinstance(mode, ZoneMode)
+        zone = self.get_zone(zoneid)
+        return self._set_zone_mode(zone, mode)
+
+    def activate_zone_boost_mqtt(self, zoneid, boost_temperature=None,
+                                  num_hours=1, timestamp=0) -> bool:
+        """Activate boost via MQTT.
+        
+        Args:
+            zoneid: Zone ID
+            boost_temperature: Optional boost temperature
+            num_hours: Boost duration (1, 2, or 3)
+            timestamp: Boost start timestamp (0 for now, None to omit)
+            
+        Returns:
+            True if command was published successfully
+        """
+        return self._set_zone_boost(
+            self.get_zone(zoneid), boost_temperature,
+            num_hours, timestamp=timestamp
+        )
+
+    def deactivate_zone_boost_mqtt(self, zoneid) -> bool:
+        """Deactivate boost via MQTT.
+        
+        Args:
+            zoneid: Zone ID
+            
+        Returns:
+            True if command was published successfully
+        """
+        return self.activate_zone_boost_mqtt(zoneid, num_hours=0, timestamp=None)
+
+    def turn_zone_on_mqtt(self, zoneid) -> bool:
+        """Turn zone ON via MQTT.
+        
+        Args:
+            zoneid: Zone ID
+            
+        Returns:
+            True if command was published successfully
+        """
+        return self.set_zone_mode_mqtt(zoneid, ZoneMode.ON)
+
+    def turn_zone_off_mqtt(self, zoneid) -> bool:
+        """Turn zone OFF via MQTT.
+        
+        Args:
+            zoneid: Zone ID
+            
+        Returns:
+            True if command was published successfully
+        """
+        return self.set_zone_mode_mqtt(zoneid, ZoneMode.OFF)
+
     def reset_login(self):
         """
         reset the login data to force a re-login
         """
         self._login_data = None
+
+    def update_zone_from_mqtt(self, mac: str, parsed_pointdata: Dict[int, Dict]) -> bool:
+        """
+        Update cached zone data from MQTT pointData.
+        
+        This allows MQTT updates to be reflected in the cached HTTP data,
+        so legacy functions like zone_mode(), zone_current_temperature() etc.
+        will return the most up-to-date values without requiring an HTTP refresh.
+        Thread-safe: Uses per-zone lock to protect pointDataList modifications.
+        
+        Args:
+            mac: Zone MAC address
+            parsed_pointdata: Dict from decode_point_data(), mapping pointIndex to
+                              {'index': int, 'datatype': int, 'value': int}
+        
+        Returns:
+            True if zone was found and updated, False otherwise
+        """
+        if not self._homes:
+            _mqtt_logger.debug("update_zone_from_mqtt: No homes cached")
+            return False
+        
+        # Find zone by MAC
+        for home in self._homes:
+            for zone in home.get('zones', []):
+                if zone.get('mac') == mac:
+                    zone_name_str = zone.get('name', 'Unknown')
+                    _mqtt_logger.debug(f"Found zone '{zone_name_str}' for MAC {mac}")
+                    
+                    lock = _get_zone_lock(zone)
+                    with lock:
+                        # Ensure pointDataList exists
+                        if 'pointDataList' not in zone:
+                            zone['pointDataList'] = []
+                        
+                        # Update each point from MQTT data
+                        for point_index, point_info in parsed_pointdata.items():
+                            new_value = str(point_info['value'])
+                            
+                            # Find existing point by index
+                            point_found = False
+                            for i, point in enumerate(zone['pointDataList']):
+                                # Handle both int and string pointIndex
+                                existing_index = point.get('pointIndex')
+                                if existing_index == point_index or str(existing_index) == str(point_index):
+                                    # Update in place
+                                    zone['pointDataList'][i]['value'] = new_value
+                                    point_found = True
+                                    _mqtt_logger.debug(f"  Updated EphFunction {point_index} = {new_value}")
+                                    break
+                            
+                            if not point_found:
+                                # Add new point
+                                zone['pointDataList'].append({
+                                    'pointIndex': point_index,
+                                    'value': new_value
+                                })
+                                _mqtt_logger.debug(f"  Added EphFunction {point_index} = {new_value}")
+                    
+                    # Update timestamp (outside lock, as it's not part of pointDataList)
+                    zone['timestamp'] = int(time.time() * 1000)
+                    zone['_last_mqtt_update'] = datetime.datetime.now().isoformat()
+                    
+                    _mqtt_logger.info(f"Updated zone '{zone_name_str}' from MQTT with {len(parsed_pointdata)} points")
+                    return True
+        
+        _mqtt_logger.debug(f"update_zone_from_mqtt: Zone with MAC {mac} not found")
+        return False
+
+    def get_zone_by_mac(self, mac: str):
+        """
+        Get zone information by MAC address.
+        
+        Args:
+            mac: Zone MAC address
+            
+        Returns:
+            Zone dict or None if not found
+        """
+        if not self._homes:
+            return None
+        
+        for home in self._homes:
+            for zone in home.get('zones', []):
+                if zone.get('mac') == mac:
+                    return zone
+        return None
 
     # Ctor
     def __init__(self, username, password, cache_home=False):
